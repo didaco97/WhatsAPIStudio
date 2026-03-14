@@ -2,6 +2,7 @@ const fs = require("fs");
 const path = require("path");
 const OpenAI = require("openai");
 require("dotenv").config();
+const { saveConversation, getConversationHistory, clearConversationHistory, getSetting, setSetting } = require("./db");
 
 let runtimeApiKey = null;
 
@@ -13,27 +14,46 @@ function getApiKey() {
   return runtimeApiKey || process.env.OPENAI_API_KEY;
 }
 
+// ===== PERSONA (stored in DB settings) =====
+function getPersona() {
+  return getSetting("persona") || "";
+}
+
+function setPersona(text) {
+  setSetting("persona", (text || "").trim());
+}
+
+// ===== CONVERSATION MEMORY (DB-backed) =====
+const MAX_HISTORY = 40; // last 40 messages (20 pairs) loaded from DB
+
+function clearHistory(contactId) {
+  clearConversationHistory(contactId || null);
+}
+
+function getAllHistoryStats() {
+  // Quick stats from DB
+  const { db } = require("./db");
+  const rows = db.prepare(`
+    SELECT contact_id, COUNT(*) as count 
+    FROM conversations 
+    GROUP BY contact_id
+  `).all();
+  return rows.map(r => ({ contactId: r.contact_id, messageCount: r.count }));
+}
+
 /**
- * Clean WhatsApp-exported chat text for AI: remove timestamps, normalize media/deleted placeholders.
- * Input format: [DD/MM/YY, H:MM:SS AM/PM] Name: message
- * Output: Name: message (one line per message, no timestamps; media/deleted normalized).
- * @param {string} rawText - raw chat export content
- * @returns {string} cleaned text suitable for AI context
+ * Clean WhatsApp-exported chat text for AI
  */
 function cleanChatForAI(rawText) {
   if (!rawText || typeof rawText !== "string") return "";
 
   const lines = rawText.split(/\r?\n/);
   const out = [];
-
-  // WhatsApp line: optional LTR mark ‎, then [date, time], then "Name: message"
   const timestampPrefix = /^\s*\u200E?\s*\[\d{1,2}\/\d{1,2}\/\d{2,4},\s*\d{1,2}:\d{2}:\d{2}\s*[AP]M\]\s*/;
 
   for (const line of lines) {
     let cleaned = line.replace(timestampPrefix, "").trim();
     if (!cleaned) continue;
-
-    // Normalize "Name: ‎image omitted" / "Name: You deleted this message." etc. for clearer AI context
     cleaned = cleaned.replace(/\u200E/g, "");
     if (/^.+:\s*image omitted\.?$/i.test(cleaned)) {
       cleaned = cleaned.replace(/\s*image omitted\.?\s*$/i, " [image]");
@@ -48,7 +68,6 @@ function cleanChatForAI(rawText) {
     } else if (/^.+:\s*You deleted this message\.?\s*$/i.test(cleaned)) {
       cleaned = cleaned.replace(/\s*You deleted this message\.?\s*$/i, " [deleted]");
     }
-
     out.push(cleaned);
   }
 
@@ -56,86 +75,130 @@ function cleanChatForAI(rawText) {
 }
 
 /**
- * Get reply as Jeet using all reference files (chats) in a folder
- * @param {string} folderPath - path to folder containing .txt chat/reference files
- * @param {string} userMessage - the message to reply to
- * @returns {Promise<string>}
+ * Get AI reply with per-contact conversation memory (DB-backed)
  */
-async function getReplyAsJeet(folderPath, userMessage) {
+async function getReplyAsJeet(folderPath, userMessage, contactId) {
   const apiKey = getApiKey();
   if (!apiKey) {
     throw new Error("No OpenAI API key. Set OPENAI_API_KEY in .env or enter it in the web app.");
   }
   const openai = new OpenAI({ apiKey });
   const fullPath = path.isAbsolute(folderPath) ? folderPath : path.join(process.cwd(), folderPath);
-  if (!fs.existsSync(fullPath) || !fs.statSync(fullPath).isDirectory()) {
-    throw new Error(`Folder not found: ${fullPath}`);
+
+  // Try to load chat reference files (optional)
+  let combinedText = "";
+  let hasChats = false;
+
+  if (fs.existsSync(fullPath) && fs.statSync(fullPath).isDirectory()) {
+    let filePaths = fs
+      .readdirSync(fullPath)
+      .filter((f) => f.endsWith(".txt"))
+      .map((f) => path.join(fullPath, f));
+
+    if (filePaths.length > 0) {
+      hasChats = true;
+      const closestName = "closest-person.txt";
+      const closestPath = filePaths.find((p) => path.basename(p) === closestName);
+      if (closestPath) {
+        filePaths = [closestPath, ...filePaths.filter((p) => p !== closestPath)];
+      }
+
+      const documents = filePaths.map((filePath) => {
+        const raw = fs.readFileSync(filePath, "utf8");
+        const content = cleanChatForAI(raw);
+        const name = path.basename(filePath);
+        const isClosest = name === closestName;
+        return `--- ${name}${isClosest ? " (PRIMARY style reference)" : ""} ---\n${content}`;
+      });
+
+      combinedText = documents.join("\n\n");
+    }
   }
 
-  let filePaths = fs
-    .readdirSync(fullPath)
-    .filter((f) => f.endsWith(".txt"))
-    .map((f) => path.join(fullPath, f));
+  // Check for custom persona (from DB)
+  const persona = getPersona();
 
-  if (filePaths.length === 0) {
-    throw new Error(`No .txt files found in ${fullPath}`);
-  }
+  // Build system prompt
+  let systemPrompt;
+  if (persona) {
+    systemPrompt = `${persona}
 
-  // Put closest-person.txt first so it's the primary style reference
-  const closestName = "closest-person.txt";
-  const closestPath = filePaths.find((p) => path.basename(p) === closestName);
-  if (closestPath) {
-    filePaths = [closestPath, ...filePaths.filter((p) => p !== closestPath)];
-  }
-
-  const documents = filePaths.map((filePath) => {
-    const raw = fs.readFileSync(filePath, "utf8");
-    const content = cleanChatForAI(raw);
-    const name = path.basename(filePath);
-    const isClosest = name === closestName;
-    return `--- ${name}${isClosest ? " (PRIMARY: chat with closest person — match this style most)" : ""} ---\n${content}`;
-  });
-
-  const combinedText = documents.join("\n\n");
-
-  const systemPrompt = `You are Jeet Vani—a real person texting friends, not an assistant or chatbot.
+IMPORTANT RULES:
+- You are chatting on WhatsApp. Keep replies short and natural like a real person.
+- Remember the conversation history — refer to what the user said before.
+- NEVER say you are an AI, bot, or assistant. Stay in character at all times.
+- Keep replies concise — 1-3 sentences max unless the user asks for detailed info.`;
+    if (hasChats) {
+      systemPrompt += `\n\nFor additional style reference, here are past chat examples:\n${combinedText}`;
+    }
+  } else if (hasChats) {
+    systemPrompt = `You are Jeet Vani—a real person texting friends, not an assistant or chatbot.
 
 VOICE & STYLE (must match the past chats, especially the "closest person" chat if present):
-- Casual Hinglish: mix English + Hindi naturally ("bhai", "aree", "kya", "dekhte hai", "achha", "badiya", "saras", "hnn").
-- Short, punchy messages. Often 1–2 lines. Sometimes multiple quick texts in a row, like real WhatsApp.
-- Informal texting: "gud", "idk", "tbh", "dw", "pls", "uk", "gracias". Occasional harmless typos are fine.
-- Terms you use: "bro", "blud", "my blud", "bbg", "broooo", stretched names ("Sakshiiii", "anjaliiii").
-- React like a friend: "Bruhhhh", "Wtf?????", "Lessgoooo", "yeyeye", "Pagal hai kya???", "Ahhhh", "Aghhhh".
-- Warm and supportive when it matters ("Do not worry too", "U will be alright", "Nahi hota i will get u").
-- NEVER sound like a bot: no "I'd be happy to", "Certainly!", bullet lists, or polished paragraphs. No emojis unless the reference chats show you using them with that person.
+- Casual Hinglish: mix English + Hindi naturally.
+- Short, punchy messages. Often 1–2 lines.
+- Informal texting style. Occasional harmless typos are fine.
+- NEVER sound like a bot: no "I'd be happy to", "Certainly!", bullet lists, or polished paragraphs.
+- Remember conversation history — refer to what the user said before.
 
-Your ONLY reference for how Jeet talks is the DOCUMENTS below. The first document (if labeled "closest person") is the main style reference—match that tone and vocabulary most closely. Do not mention documents, files, or that you are using references. Reply exactly as Jeet would in a real WhatsApp chat: one short, natural message.`;
+Reference chats:\n${combinedText}
 
-  const userPrompt = `Message to reply to:
-${userMessage}
+Match the tone and vocabulary from these chats. Reply as one short, natural message.`;
+  } else {
+    systemPrompt = `You are a real person texting on WhatsApp—NOT an assistant, NOT a chatbot.
 
----
-Past chats (how Jeet talks — match this style, especially the closest-person chat):
-${combinedText}
+RULES:
+- Talk like a real human. Casual, short, natural.
+- Use informal texting style: abbreviations, slang are fine.
+- Keep messages SHORT — 1-3 sentences max.
+- NEVER sound like a bot: no "I'd be happy to", "Certainly!", bullet lists, or polished paragraphs.
+- Be friendly, warm, and conversational.
+- Remember the conversation history — refer to what was discussed before.
+- Reply with ONE short message only.`;
+  }
 
----
-Reply once, as Jeet would in a real WhatsApp chat. One short message. Same tone and style as in the chats. Sound human, not AI.`;
+  // Build messages array with conversation history from DB
+  const messages = [{ role: "system", content: systemPrompt }];
 
-  const response = await openai.responses.create({
-    model: "gpt-4o-mini",
-    input: [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: userPrompt },
-    ],
-  });
-  console.log(response.output_text);
+  // Load conversation history from DB
+  const history = getConversationHistory(contactId, MAX_HISTORY);
+  for (const msg of history) {
+    messages.push({ role: msg.role, content: msg.content });
+  }
 
-  return response.output_text;
+  // Add current user message
+  messages.push({ role: "user", content: userMessage });
+
+  let reply;
+  try {
+    const response = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages,
+      max_tokens: 512,
+    });
+    reply = response.choices?.[0]?.message?.content || "";
+  } catch (apiErr) {
+    console.error("OpenAI API error:", apiErr.message);
+    if (apiErr.status) console.error("  HTTP status:", apiErr.status);
+    if (apiErr.code) console.error("  Error code:", apiErr.code);
+    throw apiErr;
+  }
+
+  // Save to conversation history in DB
+  saveConversation(contactId, "user", userMessage);
+  saveConversation(contactId, "assistant", reply);
+
+  console.log(`[${contactId}] AI reply:`, reply);
+  return reply;
 }
 
 module.exports = {
   getReplyAsJeet,
   setRuntimeApiKey,
   getApiKey,
+  setPersona,
+  getPersona,
   cleanChatForAI,
+  clearHistory,
+  getAllHistoryStats,
 };

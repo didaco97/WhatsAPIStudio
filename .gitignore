@@ -1,9 +1,7 @@
 # Folders
-wwwebauth/
+.wwebjs_auth/
 files/
 
 # Environment
-.env
-.env.*
 !.env.example
 node_modules/
